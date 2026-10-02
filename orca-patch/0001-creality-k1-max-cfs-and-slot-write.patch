@@ -1,0 +1,398 @@
+diff --git a/src/slic3r/Utils/CrealityPrint.cpp b/src/slic3r/Utils/CrealityPrint.cpp
+index 323db56f..cbe8dffc 100644
+--- a/src/slic3r/Utils/CrealityPrint.cpp
++++ b/src/slic3r/Utils/CrealityPrint.cpp
+@@ -1,6 +1,7 @@
+ #include "CrealityPrint.hpp"
+ 
+ #include <algorithm>
++#include <cctype>
+ #include <map>
+ #include <unordered_set>
+ #include <sstream>
+@@ -264,6 +265,8 @@ static bool is_k1_family(const std::string& model)
+         "K1 SE",
+         "K1C",
+         "K1_CFS-C",
++        "K1 Max",        // /info "model" of a K1 Max with the CFS upgrade (verified 2026-10-02, DWIN 2.3.5.34)
++        "K1 Max_CFS-C",  // by analogy with "K1_CFS-C"; not observed yet
+     };
+     return k1_models.count(model) > 0;
+ }
+@@ -290,6 +293,8 @@ static const std::map<std::string, std::string>& cfs_capable_models()
+         {"K1 SE", "K1 SE"},
+         {"K1C", "K1C"},
+         {"K1_CFS-C", "K1_CFS-C"},
++        {"K1 Max", "K1 Max"},               // CFS upgrade kit; /info still reports the plain model name
++        {"K1 Max_CFS-C", "K1 Max_CFS-C"},
+     };
+     return models;
+ }
+@@ -344,6 +349,134 @@ std::string CrealityPrint::query_boxes_info() const
+     }
+ }
+ 
++// "#RRGGBB" -> "#0RRGGBB": the firmware stores colours with a literal '0' after the '#'
++// (Creality Print: `color.slice(0,1) + "0" + color.slice(1)`).
++static std::string to_creality_color(const std::string& hex)
++{
++    std::string v = hex;
++    if (!v.empty() && v[0] == '#')
++        v = v.substr(1);
++    if (v.size() == 8) // RRGGBBAA
++        v = v.substr(0, 6);
++    if (v.size() != 6)
++        return {};
++    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return std::tolower(c); });
++    return "#0" + v;
++}
++
++static std::string from_creality_color(std::string v)
++{
++    if (!v.empty() && v[0] == '#')
++        v = v.substr(1);
++    if (v.size() == 7 && v[0] == '0')
++        v = v.substr(1);
++    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return std::toupper(c); });
++    return v.size() == 6 ? "#" + v : std::string{};
++}
++
++static bool iequals(const std::string& a, const std::string& b)
++{
++    return boost::iequals(a, b);
++}
++
++bool CrealityPrint::modify_material(int box_id, int slot_id, const CfsMaterialSpec& spec, std::string& error) const
++{
++    error.clear();
++    try {
++        net::io_context ioc;
++        websocket::stream<beast::tcp_stream> ws{ioc};
++        ws_connect(ioc, ws, m_host, "9999");
++
++        // Refuse to touch the slot table while a job runs - Creality Print's UI applies the same
++        // interlock (edits only when deviceState == 0) and the firmware ignores or garbles the
++        // write otherwise. The state arrives in the status burst right after connecting.
++        beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(6));
++        json state_query = {{"method", "get"}, {"params", {{"boxsInfo", 1}}}};
++        std::string state_msg = ws_send_and_read(ws, state_query, "deviceState", 10);
++        if (!state_msg.empty()) {
++            auto st = json::parse(state_msg, nullptr, false);
++            if (st.is_object() && st.contains("deviceState") && st["deviceState"].is_number() && st["deviceState"].get<int>() != 0) {
++                error = "the printer is busy (deviceState=" + std::to_string(st["deviceState"].get<int>()) + "); CFS slots can only be edited while idle";
++                beast::error_code close_ec;
++                ws.close(websocket::close_code::normal, close_ec);
++                return false;
++            }
++        }
++
++        json material;
++        if (spec.is_clear()) {
++            material = {{"boxId", box_id}, {"id", slot_id}, {"rfid", ""}, {"type", ""}, {"vendor", ""}, {"name", ""},
++                        {"color", ""}, {"minTemp", 0}, {"maxTemp", 0}, {"pressure", 0}};
++        } else {
++            const std::string color = to_creality_color(spec.color_hex);
++            if (color.empty()) {
++                error = "invalid colour \"" + spec.color_hex + "\" (expected #RRGGBB)";
++                return false;
++            }
++            // Creality Print adds 1e-8 so the temperatures serialise as floats; mirror it exactly.
++            material = {{"boxId", box_id},
++                        {"id", slot_id},
++                        {"rfid", spec.library_id},
++                        {"type", spec.type},
++                        {"vendor", spec.vendor},
++                        {"name", spec.name},
++                        {"color", color},
++                        {"minTemp", static_cast<double>(spec.min_temp) + 1e-8},
++                        {"maxTemp", static_cast<double>(spec.max_temp) + 1e-8},
++                        {"pressure", spec.pressure_advance}};
++        }
++        json cmd = {{"method", "set"}, {"params", {{"modifyMaterial", material}}}};
++        BOOST_LOG_TRIVIAL(info) << "CrealityPrint: modifyMaterial " << material.dump();
++
++        // The firmware answers {"modifyMaterial": <code>} and then pushes a fresh boxsInfo. Verify by
++        // reading the slot back rather than trusting the code, whose meaning differs between units.
++        beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(8));
++        std::string ack = ws_send_and_read(ws, cmd, "modifyMaterial", 10);
++        if (!ack.empty())
++            BOOST_LOG_TRIVIAL(info) << "CrealityPrint: modifyMaterial acknowledged: " << ack;
++
++        bool verified = false;
++        for (int attempt = 0; attempt < 3 && !verified; ++attempt) {
++            beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(6));
++            json boxs_query = {{"method", "get"}, {"params", {{"boxsInfo", 1}}}};
++            std::string result = ws_send_and_read(ws, boxs_query, "materialBoxs", 10);
++            if (result.empty())
++                continue;
++            auto resp = json::parse(result, nullptr, false);
++            if (!resp.is_object() || !resp.contains("boxsInfo") || !resp["boxsInfo"].contains("materialBoxs"))
++                continue;
++            for (const auto& box : resp["boxsInfo"]["materialBoxs"]) {
++                if (box.value("id", -1) != box_id || !box.contains("materials"))
++                    continue;
++                for (const auto& mat : box["materials"]) {
++                    if (mat.value("id", -1) != slot_id)
++                        continue;
++                    const std::string m_type  = mat.value("type", "");
++                    const std::string m_name  = mat.value("name", "");
++                    const std::string m_color = from_creality_color(mat.value("color", ""));
++                    if (spec.is_clear())
++                        verified = m_type.empty() && m_name.empty();
++                    else
++                        verified = iequals(m_type, spec.type) && iequals(m_name, spec.name) &&
++                                   (spec.color_hex.empty() || iequals(m_color, from_creality_color(spec.color_hex)));
++                }
++            }
++        }
++
++        beast::error_code close_ec;
++        beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(3));
++        ws.close(websocket::close_code::normal, close_ec);
++
++        if (!verified)
++            error = "the printer did not apply the slot change" + (ack.empty() ? std::string(" (no acknowledgement)") : " (" + ack + ")");
++        return verified;
++    } catch (std::exception const& e) {
++        BOOST_LOG_TRIVIAL(error) << "CrealityPrint: modifyMaterial failed: " << e.what();
++        error = e.what();
++        return false;
++    }
++}
++
+ bool CrealityPrint::start_print(wxString &msg, const std::string &filename, const std::map<std::string, std::string>& extended_info) const
+ {
+     try {
+diff --git a/src/slic3r/Utils/CrealityPrint.hpp b/src/slic3r/Utils/CrealityPrint.hpp
+index 2c3c554c..6df4f0a8 100644
+--- a/src/slic3r/Utils/CrealityPrint.hpp
++++ b/src/slic3r/Utils/CrealityPrint.hpp
+@@ -40,6 +40,27 @@ public:
+     std::string query_boxes_info() const;
+     std::string model_name() const;
+ 
++    // One CFS slot record as the firmware stores it. Empty strings / zeros clear the slot.
++    struct CfsMaterialSpec
++    {
++        std::string vendor;      // "Creality", "Generic", ...
++        std::string type;        // "PLA", "PETG", ...
++        std::string name;        // "Hyper PLA", "Generic PLA", ...
++        std::string color_hex;   // "#RRGGBB" (converted to the printer's "#0RRGGBB" on the wire)
++        std::string library_id;  // printer material-library id ("rfid" on the wire, "00001" = Generic PLA); may be empty
++        int         min_temp = 0;
++        int         max_temp = 0;
++        double      pressure_advance = 0.;
++
++        bool is_clear() const { return vendor.empty() && type.empty() && name.empty() && color_hex.empty(); }
++    };
++
++    // Write one CFS slot over the port-9999 WebSocket (`set modifyMaterial`) and verify it by
++    // re-reading boxsInfo. box_id / slot_id are the printer's own ids (CFS box is usually 1,
++    // slots 0..3). Returns false and fills `error` when the printer is unreachable, is printing,
++    // or did not apply the change.
++    bool modify_material(int box_id, int slot_id, const CfsMaterialSpec& spec, std::string& error) const;
++
+ protected:
+     virtual void set_auth(Http& http) const;
+ private:
+diff --git a/src/slic3r/Utils/CrealityPrintAgent.cpp b/src/slic3r/Utils/CrealityPrintAgent.cpp
+index 4730903c..9f1fb5da 100644
+--- a/src/slic3r/Utils/CrealityPrintAgent.cpp
++++ b/src/slic3r/Utils/CrealityPrintAgent.cpp
+@@ -4,6 +4,7 @@
+ #include "libslic3r/PrintConfig.hpp"
+ #include "slic3r/GUI/GUI_App.hpp"
+ 
++#include <boost/algorithm/string/trim.hpp>
+ #include <boost/log/trivial.hpp>
+ #include <nlohmann/json.hpp>
+ 
+@@ -263,6 +264,7 @@ bool CrealityPrintAgent::parse_cfs_response(const std::string&    response,
+ 
+             CFSSlot s;
+             s.box_id        = cfs_index;
++            s.raw_box_id    = box.value("id", 0);
+             s.slot_id       = mat.value("id",     0);
+             s.vendor        = s_vendor;
+             s.brand_name    = mat.value("name",   "");
+@@ -338,6 +340,10 @@ bool CrealityPrintAgent::fetch_filament_info(std::string dev_id, FilamentSyncMod
+         << "CrealityPrintAgent: " << box_count << " CFS box(es), "
+         << slots.size() << " loaded slot(s)";
+ 
++    // Remember which printer box id sits behind each AMS index so a later
++    // ams_filament_setting can be routed back to the right CFS unit.
++    m_box_ids = parse_cfs_box_ids(response);
++
+     // Index loaded slots by (box, slot) for O(1) lookup as we walk the full
+     // box_count * 4 grid, emitting an AmsTrayData entry for each physical slot.
+     std::map<std::pair<int, int>, const CFSSlot*> by_position;
+@@ -380,4 +386,131 @@ bool CrealityPrintAgent::fetch_filament_info(std::string dev_id, FilamentSyncMod
+     return true;
+ }
+ 
++// Printer box ids of the active CFS units in AMS order. Mirrors the filtering in
++// parse_cfs_response(): inactive boxes and the external spool holder (type 1) are skipped.
++std::vector<int> CrealityPrintAgent::parse_cfs_box_ids(const std::string& response)
++{
++    std::vector<int> ids;
++    if (response.empty())
++        return ids;
++    json resp = json::parse(response, nullptr, false);
++    if (!resp.is_object() || !resp.contains("boxsInfo") || !resp["boxsInfo"].contains("materialBoxs"))
++        return ids;
++    for (const auto& box : resp["boxsInfo"]["materialBoxs"]) {
++        if (box.value("state", 0) != 1) continue;
++        if (box.value("type", 0) != 0)  continue;
++        ids.push_back(box.value("id", 0));
++    }
++    return ids;
++}
++
++namespace {
++
++// Build the slot record for OrcaSlicer's ams_filament_setting command. The command carries the
++// Orca filament_id (tray_info_idx), the colour as RRGGBBAA, the nozzle range and the base type;
++// vendor and product name come from the matching filament preset. An empty tray_info_idx + type is
++// the AMS dialog's "Reset" and clears the slot.
++bool ams_setting_to_spec(const json& print, CrealityPrint::CfsMaterialSpec& spec, int& ams_id, int& slot_id)
++{
++    try {
++        ams_id  = print.value("ams_id", 0);
++        slot_id = print.contains("slot_id") ? print.value("slot_id", 0) : print.value("tray_id", 0);
++    } catch (const std::exception&) {
++        return false;
++    }
++    const std::string filament_id = print.value("tray_info_idx", "");
++    const std::string tray_type   = print.value("tray_type", "");
++    std::string       color       = print.value("tray_color", "");
++
++    spec = CrealityPrint::CfsMaterialSpec{};
++    if (filament_id.empty() && tray_type.empty())
++        return true; // clear
++
++    if (color.size() == 8) color = color.substr(0, 6);
++    if (color.size() == 6) spec.color_hex = "#" + color;
++    spec.type     = tray_type;
++    spec.min_temp = print.value("nozzle_temp_min", 0);
++    spec.max_temp = print.value("nozzle_temp_max", 0);
++
++    // Vendor / product name / PA from the preset that owns this filament_id.
++    if (auto* bundle = GUI::wxGetApp().preset_bundle) {
++        const Preset* best = nullptr;
++        for (const auto& p : bundle->filaments.get_presets()) {
++            if (p.filament_id != filament_id) continue;
++            // Prefer system presets so user copies with odd names do not leak into the printer.
++            if (best == nullptr || (p.is_system && !best->is_system)) best = &p;
++        }
++        if (best != nullptr) {
++            if (const auto* fv = best->config.option<ConfigOptionStrings>("filament_vendor"); fv && !fv->values.empty())
++                spec.vendor = fv->values.front();
++            if (const auto* ft = best->config.option<ConfigOptionStrings>("filament_type"); ft && !ft->values.empty() && spec.type.empty())
++                spec.type = ft->values.front();
++            if (const auto* pa = best->config.option<ConfigOptionFloats>("pressure_advance"); pa && !pa->values.empty())
++                spec.pressure_advance = pa->values.front();
++            if (spec.min_temp == 0)
++                if (const auto* lo = best->config.option<ConfigOptionInts>("nozzle_temperature_range_low"); lo && !lo->values.empty())
++                    spec.min_temp = lo->values.front();
++            if (spec.max_temp == 0)
++                if (const auto* hi = best->config.option<ConfigOptionInts>("nozzle_temperature_range_high"); hi && !hi->values.empty())
++                    spec.max_temp = hi->values.front();
++            // "Hyper PLA @Creality K1 Max_CFS-C-all" -> "Hyper PLA"
++            spec.name = best->name.substr(0, best->name.find('@'));
++            boost::trim(spec.name);
++        }
++    }
++    if (spec.vendor.empty()) spec.vendor = "Generic";
++    if (spec.name.empty())   spec.name = (spec.vendor == "Generic" ? "Generic " : spec.vendor + " ") + spec.type;
++    if (spec.min_temp == 0)  spec.min_temp = 190;
++    if (spec.max_temp == 0)  spec.max_temp = 240;
++    // The library id ("rfid") is only known to the printer; leave it empty and let the firmware
++    // treat the record as a user material. Creality Print behaves the same for unknown names.
++    return !spec.type.empty();
++}
++
++} // namespace
++
++int CrealityPrintAgent::send_message_to_printer(std::string dev_id, std::string json_str, int qos, int flag)
++{
++    json msg = json::parse(json_str, nullptr, false);
++    if (msg.is_object() && msg.contains("print") && msg["print"].is_object() &&
++        msg["print"].value("command", "") == "ams_filament_setting") {
++        if (device_info.dev_ip.empty())
++            return BAMBU_NETWORK_ERR_INVALID_HANDLE;
++
++        CrealityPrint::CfsMaterialSpec spec;
++        int ams_id = 0, slot_id = 0;
++        if (!ams_setting_to_spec(msg["print"], spec, ams_id, slot_id)) {
++            BOOST_LOG_TRIVIAL(warning) << "CrealityPrintAgent: malformed ams_filament_setting: " << json_str;
++            return BAMBU_NETWORK_ERR_INVALID_HANDLE;
++        }
++        if (ams_id < 0 || ams_id >= static_cast<int>(m_box_ids.size())) {
++            BOOST_LOG_TRIVIAL(warning) << "CrealityPrintAgent: ams_filament_setting for unknown AMS index " << ams_id
++                                       << " (known CFS boxes: " << m_box_ids.size() << ")";
++            return ORCA_NETWORK_ERR_CAP_NOT_AVAILABLE;
++        }
++        const int box_id = m_box_ids[ams_id];
++
++        DynamicPrintConfig cfg;
++        cfg.set_key_value("print_host",                  new ConfigOptionString("http://" + device_info.dev_ip));
++        cfg.set_key_value("print_host_webui",            new ConfigOptionString(""));
++        cfg.set_key_value("printhost_cafile",            new ConfigOptionString(""));
++        cfg.set_key_value("printhost_port",              new ConfigOptionString(""));
++        cfg.set_key_value("printhost_apikey",            new ConfigOptionString(device_info.api_key));
++        cfg.set_key_value("printhost_ssl_ignore_revoke", new ConfigOptionBool(false));
++        CrealityPrint host(&cfg);
++
++        std::string error;
++        const bool  ok = host.modify_material(box_id, slot_id, spec, error);
++        BOOST_LOG_TRIVIAL(info) << "CrealityPrintAgent: ams_filament_setting -> CFS box " << box_id << " slot " << slot_id
++                                << (ok ? " applied" : " FAILED: " + error);
++        if (ok) {
++            // Refresh the trays so the sidebar / device tab reflect the printer's view of the slot.
++            fetch_filament_info(dev_id);
++            return BAMBU_NETWORK_SUCCESS;
++        }
++        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
++    }
++    return MoonrakerPrinterAgent::send_message_to_printer(std::move(dev_id), std::move(json_str), qos, flag);
++}
++
+ } // namespace Slic3r
+diff --git a/src/slic3r/Utils/CrealityPrintAgent.hpp b/src/slic3r/Utils/CrealityPrintAgent.hpp
+index cf22d104..b6d56749 100644
+--- a/src/slic3r/Utils/CrealityPrintAgent.hpp
++++ b/src/slic3r/Utils/CrealityPrintAgent.hpp
+@@ -28,6 +28,7 @@ public:
+     struct CFSSlot
+     {
+         int         box_id  = 0;   // CFS unit index (0 for first box, 1 for chained second box)
++        int         raw_box_id = 0; // The printer's own box id (the CFS is box 1 on K1-family; 0 is the spool holder)
+         int         slot_id = 0;   // Slot index within the box (0..3)
+         std::string color_hex;     // "#RRGGBB"
+         std::string filament_type; // "PLA", "ABS", "PETG", ...
+@@ -43,6 +44,15 @@ public:
+ 
+     bool fetch_filament_info(std::string dev_id, FilamentSyncMode sync_mode = FilamentSyncMode::pull) override;
+ 
++    // Translate OrcaSlicer's AMS commands into CFS writes. `ams_filament_setting` (what the AMS
++    // edit dialog publishes) becomes a `modifyMaterial` on the matching CFS slot; everything else
++    // is handed to the Moonraker base agent.
++    int send_message_to_printer(std::string dev_id, std::string json_str, int qos, int flag) override;
++
++    // The printer's box ids of the active CFS units, in the order they were published as AMS
++    // units by fetch_filament_info() (AMS index -> raw box id).
++    static std::vector<int> parse_cfs_box_ids(const std::string& response);
++
+     // Parse the boxsInfo JSON returned by CrealityPrint::query_boxes_info() into
+     // a flat list of loaded slots, plus the count of CFS boxes the printer reports.
+     static bool parse_cfs_response(const std::string&    response,
+@@ -60,6 +70,9 @@ public:
+                                              const std::string&      vendor,
+                                              const std::string&      brand_name,
+                                              const std::string&      base_type);
++
++private:
++    std::vector<int> m_box_ids; // filled by fetch_filament_info(); see parse_cfs_box_ids()
+ };
+ 
+ } // namespace Slic3r
