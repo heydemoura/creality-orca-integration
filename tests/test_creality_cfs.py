@@ -308,6 +308,190 @@ class PresetIndexTests(unittest.TestCase):
             self.assertEqual(presets[1].type, "PLA")
 
 
+class AutoSyncPlanningTests(unittest.TestCase):
+    """Project filament list -> CFS slot writes (the automatic sync's decision logic)."""
+
+    def setUp(self):
+        self.snap = snapshot_from_fixture()  # 4 slots, all Generic PLA: red, black, white, grey
+        self.presets = [
+            cfs.PresetInfo(name="Generic PLA @K1 Max_CFS-C-all", vendor="Generic", type="PLA", filament_id="OFDSrzZ8", min_temp=190, max_temp=240, pressure_advance=0.04, is_system=True),
+            cfs.PresetInfo(name="Hyper PLA @K1 Max_CFS-C-all", vendor="Creality", type="PLA", filament_id="OFCZsqXg", min_temp=190, max_temp=240, pressure_advance=0.04, is_system=True),
+            cfs.PresetInfo(name="Generic PETG @K1 Max_CFS-C-all", vendor="Generic", type="PETG", filament_id="OFYPdQJh", min_temp=220, max_temp=270, pressure_advance=0.08, is_system=True),
+        ]
+
+    def test_signature_tracks_names_and_colours_only(self):
+        a = cfs.project_signature([{"name": "X", "color": "#ff0000", "type": "PLA"}])
+        b = cfs.project_signature([{"name": "X", "color": "#FF0000", "type": "PETG"}])
+        c = cfs.project_signature([{"name": "X", "color": "#00ff00"}])
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, c)
+
+    def test_no_writes_when_project_matches_printer(self):
+        project = [
+            {"name": "Generic PLA @K1 Max_CFS-C-all", "color": "#FF1E1E"},
+            {"name": "Generic PLA @K1 Max_CFS-C-all", "color": "#000000"},
+            {"name": "Generic PLA @K1 Max_CFS-C-all", "color": "#FFFFFF"},
+            {"name": "Generic PLA @K1 Max_CFS-C-all", "color": "#9EA7AE"},
+        ]
+        self.assertEqual(cfs.plan_project_sync(project, self.presets, self.snap), [])
+
+    def test_only_changed_slots_are_written(self):
+        project = [
+            {"name": "Generic PLA @K1 Max_CFS-C-all", "color": "#FF1E1E"},   # unchanged
+            {"name": "Hyper PLA @K1 Max_CFS-C-all", "color": "#000000"},     # material changed
+            {"name": "Generic PLA @K1 Max_CFS-C-all", "color": "#123456"},   # colour changed
+            {"name": "Generic PETG @K1 Max_CFS-C-all", "color": "#9EA7AE"},  # type changed
+            {"name": "Generic PLA @K1 Max_CFS-C-all", "color": "#FFFFFF"},   # 5th filament: no slot
+        ]
+        plan = cfs.plan_project_sync(project, self.presets, self.snap)
+        self.assertEqual([s.label for s, _ in plan], ["1B", "1C", "1D"])
+        specs = {s.label: spec for s, spec in plan}
+        self.assertEqual((specs["1B"].name, specs["1B"].rfid, specs["1B"].color), ("Hyper PLA", "01001", "#000000"))
+        self.assertEqual((specs["1C"].name, specs["1C"].color), ("Generic PLA", "#123456"))
+        self.assertEqual((specs["1D"].type, specs["1D"].rfid, specs["1D"].min_temp, specs["1D"].max_temp), ("PETG", "00003", 220, 270))
+
+    def test_rfid_locked_and_empty_slots(self):
+        self.snap.boxes[1].slots[0].state = cfs.SLOT_STATE_RFID
+        empty = self.snap.boxes[1].slots[1]
+        empty.state = 0
+        empty.vendor = empty.name = empty.type = empty.color = ""
+        project = [
+            {"name": "Hyper PLA @K1 Max_CFS-C-all", "color": "#000000"},
+            {"name": "Generic PLA @K1 Max_CFS-C-all", "color": "#000000"},  # same material as the empty slot's old record
+        ]
+        plan = cfs.plan_project_sync(project, self.presets, self.snap)
+        self.assertEqual([s.label for s, _ in plan], ["1B"])  # 1A locked, 1B empty -> gets filled
+
+    def test_library_temps_option(self):
+        project = [{"name": "Hyper PLA @K1 Max_CFS-C-all", "color": "#000000"}]
+        hyper = [p for p in self.presets if p.name.startswith("Hyper")]
+        hyper[0].min_temp, hyper[0].max_temp, hyper[0].pressure_advance = 205, 225, 0.031
+        (slot, spec), = cfs.plan_project_sync(project, hyper, self.snap, temps_from="preset")
+        self.assertEqual((spec.min_temp, spec.max_temp, spec.pressure), (205, 225, 0.031))
+        (slot, spec), = cfs.plan_project_sync(project, hyper, self.snap, temps_from="library")
+        self.assertEqual((spec.min_temp, spec.max_temp, spec.pressure), (190, 240, 0.04))
+
+
+class OpcReaderTests(unittest.TestCase):
+    """OrcaSlicer's binary vendor preset cache is the source of system preset ids in release builds."""
+
+    def _filaments(self):
+        return [
+            {"name": "fdm_filament_common", "instantiation": "false", "config": {
+                "filament_type": ("strings", ["PLA"]), "nozzle_temperature_range_low": ("ints", [190]),
+                "filament_cost": ("floats", [20.0]), "filament_retract_lift_above": ("floats", [float("nan")]),
+                "slow_down_layer_time": ("ints", [4]), "filament_wipe": ("bools", [True]),
+                "filament_z_hop_types": ("enums", ["Normal Lift"]), "fan_speedup_overhangs": ("bool", True),
+                "compatible_printers_condition": ("string", ""), "filament_shrink": ("percents", [100.0]),
+                "filament_retract_length": ("floats_or_percents", [(0.8, False), (10.0, True)]),
+                "bed_exclude_area": ("points", [(0.0, 0.0), (1.0, 2.0)]), "extruder_offset": ("points", [(0.0, 0.0)]),
+                "wipe_tower_x": ("floats", [15.0]), "nozzle_height": ("float", 4.5), "flush_volumes": ("ints_groups", [[1, 2], [3]]),
+                "head_wrap_detect_zone": ("points_groups", [[(0.0, 0.0), (1.0, 1.0)]]), "curr_bed_type": ("enum", "Textured PEI Plate"),
+                "printer_notes": ("string", "hello world"), "thumbnail_size": ("point3", (1.0, 2.0, 3.0)), "layer_height": ("percent", 0.2),
+                "wall_count": ("int", 2), "unknown_enum": ("enum", 7),
+            }},
+            {"name": "fdm_filament_pla", "inherits": "fdm_filament_common", "instantiation": "false", "config": {
+                "nozzle_temperature_range_high": ("ints", [230]), "default_filament_colour": ("strings", ["#FFFFFF"]),
+            }},
+            {"name": "Generic PLA @Test", "inherits": "fdm_filament_pla", "filament_id": "GFL98", "setting_id": "GFSA00", "config": {
+                "filament_vendor": ("strings", ["Generic"]), "pressure_advance": ("floats", [0.03]),
+                "compatible_printers": ("strings", ["Test 0.4 nozzle"]), "nozzle_temperature_range_high": ("ints", [240]),
+            }},
+            {"name": "Hyper PLA @Test", "inherits": "fdm_filament_pla", "filament_id": "OFHYP1", "config": {
+                "filament_vendor": ("strings", ["Creality"]), "default_filament_colour": ("strings", ["#FF0000"]),
+            }},
+            {"name": "My tuned PLA @Test", "inherits": "Hyper PLA @Test", "config": {"pressure_advance": ("floats", [0.02])}},
+        ]
+
+    def test_round_trip_and_chain(self):
+        import tempfile
+        from fake_opc import build_opc
+
+        blob = build_opc("Test", self._filaments(), processes=[{"name": "0.20mm @Test", "config": {"wall_count": ("int", 3), "layer_height": ("percent", 0.2)}}],
+                         machines=[{"name": "Test 0.4 nozzle", "config": {"printer_notes": ("string", "x"), "extruder_offset": ("points", [(0, 0)])}}],
+                         enum_values=["Normal Lift", "Textured PEI Plate"])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "Test.opc")
+            with open(path, "wb") as fh:
+                fh.write(blob)
+            vendor, presets = cfs.read_opc_filaments(path)
+        self.assertEqual(vendor, "Test")
+        self.assertEqual(set(presets), {"fdm_filament_common", "fdm_filament_pla", "Generic PLA @Test", "Hyper PLA @Test", "My tuned PLA @Test"})
+        self.assertEqual(presets["Generic PLA @Test"].filament_id, "GFL98")
+        self.assertEqual(presets["Generic PLA @Test"].compatible_printers, ["Test 0.4 nozzle"])
+        self.assertEqual(presets["fdm_filament_common"].type, "PLA")
+        generic = cfs.resolve_opc_chain(presets, "Generic PLA @Test")
+        self.assertEqual((generic.filament_id, generic.vendor, generic.type, generic.min_temp, generic.max_temp, generic.pressure_advance, generic.color),
+                         ("GFL98", "Generic", "PLA", 190, 240, 0.03, "#FFFFFF"))
+        tuned = cfs.resolve_opc_chain(presets, "My tuned PLA @Test")
+        self.assertEqual((tuned.filament_id, tuned.vendor, tuned.max_temp, tuned.pressure_advance, tuned.color), ("OFHYP1", "Creality", 230, 0.02, "#FF0000"))
+        self.assertIsNone(cfs.resolve_opc_chain(presets, "nope"))
+
+    def test_rejects_wrong_version_and_crc(self):
+        import tempfile
+        from fake_opc import build_opc
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_version = os.path.join(tmp, "v.opc")
+            with open(bad_version, "wb") as fh:
+                fh.write(build_opc("Test", self._filaments()[:1], version=3))
+            with self.assertRaises(cfs.OpcFormatError):
+                cfs.read_opc_filaments(bad_version)
+            bad_crc = os.path.join(tmp, "c.opc")
+            with open(bad_crc, "wb") as fh:
+                fh.write(build_opc("Test", self._filaments()[:1], corrupt_crc=True))
+            with self.assertRaises(cfs.OpcFormatError):
+                cfs.read_opc_filaments(bad_crc)
+            not_opc = os.path.join(tmp, "x.opc")
+            with open(not_opc, "wb") as fh:
+                fh.write(b"ZCRO" + b"\0" * 40)
+            with self.assertRaises(cfs.OpcFormatError):
+                cfs.read_opc_filaments(not_opc)
+
+    def test_preset_index_completes_system_presets_from_cache(self):
+        import tempfile
+        from fake_opc import build_opc
+
+        with tempfile.TemporaryDirectory() as tmp:
+            system = os.path.join(tmp, "system")
+            os.makedirs(system)
+            with open(os.path.join(system, "Test.opc"), "wb") as fh:
+                fh.write(build_opc("Test", self._filaments(), enum_values=["Normal Lift", "Textured PEI Plate"]))
+            user_dir = os.path.join(tmp, "user", "default", "filament")
+            os.makedirs(user_dir)
+            # A user preset saved as JSON that inherits a system preset: id must come through the cache.
+            with open(os.path.join(user_dir, "Mine.json"), "w") as fh:
+                json.dump({"name": "Mine", "inherits": "Hyper PLA @Test", "filament_settings_id": ["Mine"]}, fh)
+            presets = [
+                cfs.PresetInfo(name="Generic PLA @Test", is_system=True),               # no file: release build
+                cfs.PresetInfo(name="Hyper PLA @Test", is_system=True, vendor="Creality"),
+                cfs.PresetInfo(name="Mine", file=os.path.join(user_dir, "Mine.json"), is_user=True),
+                cfs.PresetInfo(name="Unknown @Elsewhere", is_system=True),
+            ]
+            cfs.PresetIndex().build(presets)
+        self.assertEqual((presets[0].filament_id, presets[0].vendor, presets[0].type, presets[0].min_temp, presets[0].max_temp), ("GFL98", "Generic", "PLA", 190, 240))
+        self.assertEqual((presets[1].filament_id, presets[1].type, presets[1].color), ("OFHYP1", "PLA", "#FF0000"))
+        self.assertEqual((presets[2].filament_id, presets[2].vendor, presets[2].type), ("OFHYP1", "Creality", "PLA"))
+        self.assertEqual(presets[3].filament_id, "")
+
+    def test_real_bundle_when_available(self):
+        """Smoke test against a real OrcaSlicer install when one is around (skipped otherwise)."""
+        candidates = [
+            os.path.expanduser("~/.config/OrcaSlicer-cfs-test/system/Creality.opc"),
+            os.path.expanduser("~/.config/OrcaSlicer/system/Creality.opc"),
+        ]
+        path = next((c for c in candidates if os.path.isfile(c)), None)
+        if path is None:
+            self.skipTest("no OrcaSlicer vendor cache installed")
+        vendor, presets = cfs.read_opc_filaments(path)
+        self.assertEqual(vendor, "Creality")
+        self.assertGreater(len(presets), 100)
+        generic = cfs.resolve_opc_chain(presets, "Generic PLA @K1 Max_CFS-C-all")
+        self.assertIsNotNone(generic)
+        self.assertTrue(generic.filament_id)
+        self.assertEqual(generic.type, "PLA")
+
+
 class ClientAgainstFakePrinterTests(unittest.TestCase):
     """End-to-end over a real TCP WebSocket against the fake firmware."""
 

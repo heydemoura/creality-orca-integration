@@ -92,6 +92,32 @@ if not LOG.handlers:
 LOG.setLevel(logging.INFO)
 
 
+def _attach_plugin_log_file() -> Optional[str]:
+    """Also log into the plugin's own storage folder (<datadir>/orca_plugins/plugin_data/creality_cfs/).
+
+    OrcaSlicer's stderr tee can lose lines emitted on its UI thread, which is where most of the
+    sync decisions are made; the plugin's storage folder is the place OrcaSlicer reserves for a
+    plugin's own files, so a small rotating log there keeps the whole story in one place.
+    """
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        plugins_dir = os.path.dirname(here)
+        if os.path.basename(plugins_dir) != "orca_plugins":
+            return None
+        key = os.path.basename(here)
+        folder = os.path.join(plugins_dir, "plugin_data", key)
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, "creality_cfs.log")
+        from logging.handlers import RotatingFileHandler
+
+        handler = RotatingFileHandler(path, maxBytes=1_000_000, backupCount=2, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(threadName)s %(levelname)s %(message)s"))
+        LOG.addHandler(handler)
+        return path
+    except Exception:
+        return None
+
+
 # =====================================================================================================
 # Colour helpers
 # =====================================================================================================
@@ -1232,6 +1258,46 @@ def shutdown_clients() -> None:
 
 
 # =====================================================================================================
+# Project -> CFS synchronisation planning (pure, testable)
+# =====================================================================================================
+
+
+def project_signature(project: Iterable[dict]) -> str:
+    """A stable string describing the project's filament list (preset names + colours)."""
+    return json.dumps([[f.get("name", ""), normalize_hex(f.get("color", ""), "")] for f in project], separators=(",", ":"))
+
+
+def plan_project_sync(
+    project: list[dict],
+    presets: Iterable[PresetInfo],
+    snapshot: PrinterSnapshot,
+    temps_from: str = "preset",
+) -> list[tuple[CfsSlot, MaterialSpec]]:
+    """Which CFS slots have to change so that slot i holds project filament i.
+
+    Only slots whose record differs (material name/type/vendor or colour) are returned; RFID-locked
+    slots are never touched; extra project filaments beyond the slot count are ignored.
+    """
+    slots = [s for box in snapshot.cfs_boxes for s in box.slots]
+    presets = list(presets)
+    plan: list[tuple[CfsSlot, MaterialSpec]] = []
+    for i, f in enumerate(project):
+        if i >= len(slots):
+            break
+        slot = slots[i]
+        if slot.is_rfid_locked:
+            continue
+        preset = next((p for p in presets if p.name == f.get("name")), None)
+        if preset is None:
+            preset = PresetInfo(name=str(f.get("name") or ""), vendor=str(f.get("vendor") or ""), type=str(f.get("type") or ""))
+        spec, _entry = spec_from_preset(preset, str(f.get("color") or ""), snapshot.library, temps_from)
+        if _slot_matches(slot, spec) and slot.is_loaded:
+            continue
+        plan.append((slot, spec))
+    return plan
+
+
+# =====================================================================================================
 # OrcaSlicer (Bambu-protocol) payload building - what MachineObject::parse_json understands
 # =====================================================================================================
 
@@ -1426,6 +1492,356 @@ def ams_setting_to_spec(
 
 
 # =====================================================================================================
+# OrcaSlicer vendor preset cache (.opc) reader
+# =====================================================================================================
+#
+# Release builds of OrcaSlicer 2.5 ship (and keep in <datadir>/system) each vendor's presets as a
+# binary cache: a 20-byte header (magic "ORCZ", format version, body size, CRC32) framing one cereal
+# binary archive. The body is: format version (u32), vendor name, vendor profile version, the option
+# dictionary (keys, option types, enum names), the vendor profile map, then the process / filament /
+# machine presets, each with its own config diff, `inherits`, `setting_id` and `filament_id`. See
+# src/libslic3r/PresetCacheFormat.{hpp,cpp} in OrcaSlicer. This reader mirrors the writer exactly,
+# refuses any other format version, and is the only way to learn a system preset's filament_id when
+# no JSON profile sources are installed.
+
+OPC_MAGIC = 0x4F52435A
+OPC_VERSION = 2
+
+_CO_VECTOR = 0x4000
+_CO_FLOAT, _CO_INT, _CO_STRING, _CO_PERCENT, _CO_FLOAT_OR_PERCENT, _CO_POINT, _CO_POINT3, _CO_BOOL, _CO_ENUM = 1, 2, 3, 4, 5, 6, 7, 8, 9
+_CO_POINTS_GROUPS, _CO_INTS_GROUPS = 10 + _CO_VECTOR, 11 + _CO_VECTOR
+
+
+class OpcFormatError(Exception):
+    pass
+
+
+class _BinaryReader:
+    """Sequential reader for cereal's BinaryArchive (little endian, u64 size tags, 1-byte bools)."""
+
+    __slots__ = ("data", "pos")
+
+    def __init__(self, data: bytes, pos: int = 0):
+        self.data = data
+        self.pos = pos
+
+    def _take(self, n: int) -> bytes:
+        end = self.pos + n
+        if end > len(self.data):
+            raise OpcFormatError("unexpected end of preset cache body")
+        chunk = self.data[self.pos : end]
+        self.pos = end
+        return chunk
+
+    def u8(self) -> int:
+        return self._take(1)[0]
+
+    def u16(self) -> int:
+        return struct.unpack("<H", self._take(2))[0]
+
+    def u32(self) -> int:
+        return struct.unpack("<I", self._take(4))[0]
+
+    def i32(self) -> int:
+        return struct.unpack("<i", self._take(4))[0]
+
+    def u64(self) -> int:
+        return struct.unpack("<Q", self._take(8))[0]
+
+    def f64(self) -> float:
+        return struct.unpack("<d", self._take(8))[0]
+
+    def size(self) -> int:
+        n = self.u64()
+        if n > 50_000_000:
+            raise OpcFormatError("implausible size tag in preset cache")
+        return n
+
+    def string(self) -> str:
+        n = self.size()
+        return self._take(n).decode("utf-8", "replace")
+
+    def strings(self) -> list[str]:
+        return [self.string() for _ in range(self.size())]
+
+    def skip(self, n: int) -> None:
+        self._take(n)
+
+
+@dataclass
+class OpcPreset:
+    name: str
+    inherits: str = ""
+    filament_id: str = ""
+    setting_id: str = ""
+    instantiation: str = ""
+    vendor: str = ""
+    type: str = ""
+    min_temp: int = 0
+    max_temp: int = 0
+    pressure_advance: float = 0.0
+    color: str = ""
+    compatible_printers: list[str] = field(default_factory=list)
+
+
+# Filament options the plugin extracts from a cached config diff (everything else is skipped).
+_OPC_WANTED = {
+    "filament_vendor",
+    "filament_type",
+    "nozzle_temperature_range_low",
+    "nozzle_temperature_range_high",
+    "pressure_advance",
+    "default_filament_colour",
+    "compatible_printers",
+}
+
+
+def _opc_read_option(r: _BinaryReader, opt_type: int) -> Any:
+    """Read one option payload of the given ConfigOptionType; returns a Python value."""
+    if opt_type in (_CO_ENUM, _CO_ENUM + _CO_VECTOR):
+        values = []
+        for _ in range(r.u32()):
+            idx = r.u16()
+            values.append(r.i32() if idx == 0 else idx)
+        return values
+    if opt_type == _CO_POINTS_GROUPS:
+        groups = []
+        for _ in range(r.size()):
+            m = r.size()
+            r.skip(16 * m)
+            groups.append(m)
+        return groups
+    if opt_type == _CO_INTS_GROUPS:
+        groups = []
+        for _ in range(r.size()):
+            m = r.size()
+            groups.append([r.i32() for _ in range(m)])
+        return groups
+    is_vector = bool(opt_type & _CO_VECTOR)
+    base = opt_type & ~_CO_VECTOR
+    count = r.size() if is_vector else 1
+    if base in (_CO_FLOAT, _CO_PERCENT):
+        vals = [r.f64() for _ in range(count)]
+    elif base == _CO_INT:
+        vals = [r.i32() for _ in range(count)]
+    elif base == _CO_STRING:
+        vals = [r.string() for _ in range(count)]
+    elif base == _CO_FLOAT_OR_PERCENT:
+        vals = []
+        for _ in range(count):
+            v = r.f64()
+            pct = r.u8()
+            vals.append((v, bool(pct)))
+    elif base == _CO_POINT:
+        vals = [(r.f64(), r.f64()) for _ in range(count)]
+    elif base == _CO_POINT3:
+        vals = [(r.f64(), r.f64(), r.f64()) for _ in range(count)]
+    elif base == _CO_BOOL:
+        vals = [bool(r.u8()) for _ in range(count)]
+    else:
+        raise OpcFormatError(f"unknown option type {opt_type:#x} in preset cache")
+    return vals if is_vector else vals[0]
+
+
+def _opc_skip_vendor_map(r: _BinaryReader) -> list[str]:
+    """Consume the VendorProfile map; returns the vendor names."""
+    names = []
+    for _ in range(r.size()):
+        key = r.string()
+        names.append(key)
+        r.string()  # name
+        r.string()  # id
+        r.string()  # config_version (Semver saved as a string)
+        r.string()  # config_update_url
+        r.string()  # changelog_url
+        for _m in range(r.size()):  # models
+            r.string()  # id
+            r.string()  # name
+            r.string()  # model_id
+            r.u8()  # technology (unsigned char enum)
+            r.string()  # family
+            for _v in range(r.size()):  # variants
+                r.string()
+            r.strings()  # default_materials
+            r.strings()  # not_support_bed_types
+            for _s in range(9):  # bed_model .. hotend_model
+                r.string()
+        r.strings()  # default_filaments (set)
+        r.strings()  # default_sla_materials (set)
+    return names
+
+
+def _opc_read_entries(r: _BinaryReader, keys: list[str], types: list[int], want: bool) -> list[OpcPreset]:
+    out: list[OpcPreset] = []
+    for _ in range(r.u32()):
+        name = r.string()
+        r.string()  # sub_path
+        preset = OpcPreset(name=name)
+        for _o in range(r.u32()):
+            idx = r.u16()
+            if idx >= len(keys):
+                raise OpcFormatError("option index past the end of the dictionary")
+            value = _opc_read_option(r, types[idx])
+            if want and keys[idx] in _OPC_WANTED:
+                key = keys[idx]
+                if key == "filament_vendor":
+                    preset.vendor = str(_first(value) or "")
+                elif key == "filament_type":
+                    preset.type = str(_first(value) or "")
+                elif key == "nozzle_temperature_range_low":
+                    preset.min_temp = _int(_first(value))
+                elif key == "nozzle_temperature_range_high":
+                    preset.max_temp = _int(_first(value))
+                elif key == "pressure_advance":
+                    preset.pressure_advance = _num(_first(value))
+                elif key == "default_filament_colour":
+                    preset.color = normalize_hex(str(_first(value) or ""), "")
+                elif key == "compatible_printers":
+                    preset.compatible_printers = [str(v) for v in value] if isinstance(value, list) else []
+        preset.inherits = r.string()
+        r.strings()  # includes
+        r.string()  # description
+        preset.instantiation = r.string()
+        preset.setting_id = r.string()
+        preset.filament_id = r.string()
+        r.strings()  # renamed_from
+        if want:
+            out.append(preset)
+    return out
+
+
+def read_opc_filaments(path: str) -> tuple[str, dict[str, OpcPreset]]:
+    """Return (vendor_name, {preset name: OpcPreset}) for the filament presets in a .opc file.
+
+    Raises OpcFormatError for anything that is not a version-2 cache with a valid CRC.
+    """
+    import zlib
+
+    with open(path, "rb") as fh:
+        blob = fh.read()
+    if len(blob) < 20:
+        raise OpcFormatError("file too small")
+    magic, version, size, crc = struct.unpack("<IIQI", blob[:20])
+    if magic != OPC_MAGIC:
+        raise OpcFormatError("not an OrcaSlicer preset cache (bad magic)")
+    if version != OPC_VERSION:
+        raise OpcFormatError(f"unsupported preset cache format version {version}")
+    body = blob[20 : 20 + size]
+    if len(body) != size:
+        raise OpcFormatError("truncated preset cache")
+    if zlib.crc32(body) & 0xFFFFFFFF != crc:
+        raise OpcFormatError("preset cache CRC mismatch")
+    r = _BinaryReader(body)
+    if r.u32() != OPC_VERSION:
+        raise OpcFormatError("body version mismatch")
+    vendor_name = r.string()
+    r.string()  # vendor profile version
+    keys = r.strings()
+    types = [r.u16() for _ in range(r.size())]
+    enum_values = r.strings()
+    if len(keys) != len(types) or not enum_values or enum_values[0] != "":
+        raise OpcFormatError("corrupt option dictionary")
+    _opc_skip_vendor_map(r)
+    _opc_read_entries(r, keys, types, want=False)  # process presets
+    filaments = _opc_read_entries(r, keys, types, want=True)
+    # machine presets and the parse-error counter follow; not needed.
+    return vendor_name, {p.name: p for p in filaments}
+
+
+def resolve_opc_chain(presets: dict[str, OpcPreset], name: str) -> Optional[OpcPreset]:
+    """Fold a preset's `inherits` chain into one record (child values win), like OrcaSlicer does."""
+    chain: list[OpcPreset] = []
+    seen: set[str] = set()
+    current = presets.get(name)
+    while current is not None and current.name not in seen and len(chain) < 16:
+        chain.append(current)
+        seen.add(current.name)
+        current = presets.get(current.inherits) if current.inherits else None
+    if not chain:
+        return None
+    out = OpcPreset(name=name, inherits=chain[0].inherits, setting_id=chain[0].setting_id, instantiation=chain[0].instantiation)
+    for p in chain:  # child first: keep the first non-empty value
+        out.filament_id = out.filament_id or p.filament_id
+        out.vendor = out.vendor or p.vendor
+        out.type = out.type or p.type
+        out.min_temp = out.min_temp or p.min_temp
+        out.max_temp = out.max_temp or p.max_temp
+        out.pressure_advance = out.pressure_advance or p.pressure_advance
+        out.color = out.color or p.color
+        out.compatible_printers = out.compatible_printers or p.compatible_printers
+    return out
+
+
+class OpcCatalog:
+    """All filament presets from every .opc bundle found in the OrcaSlicer system directories."""
+
+    def __init__(self) -> None:
+        self._files: dict[str, tuple[float, dict[str, OpcPreset]]] = {}
+        self._lock = threading.Lock()
+        self.errors: dict[str, str] = {}
+
+    @staticmethod
+    def candidate_dirs(hints: Iterable[str] = ()) -> list[str]:
+        """Directories that may hold <vendor>.opc files: <datadir>/system plus any hinted paths."""
+        dirs: list[str] = []
+        # The plugin itself lives in <datadir>/orca_plugins/<dir>/, which pins the data directory.
+        here = os.path.dirname(os.path.abspath(__file__))
+        for up in range(1, 4):
+            base = here
+            for _ in range(up):
+                base = os.path.dirname(base)
+            dirs.append(os.path.join(base, "system"))
+        for hint in hints:
+            if not hint:
+                continue
+            p = os.path.abspath(hint)
+            for _ in range(5):
+                dirs.append(os.path.join(p, "system"))
+                parent = os.path.dirname(p)
+                if parent == p:
+                    break
+                p = parent
+        seen: set[str] = set()
+        out = []
+        for d in dirs:
+            if d not in seen and os.path.isdir(d):
+                seen.add(d)
+                out.append(d)
+        return out
+
+    def load(self, hints: Iterable[str] = ()) -> dict[str, OpcPreset]:
+        """Read (or re-read when changed) every .opc file and return the merged filament catalog."""
+        merged: dict[str, OpcPreset] = {}
+        for d in self.candidate_dirs(hints):
+            try:
+                names = sorted(f for f in os.listdir(d) if f.lower().endswith(".opc"))
+            except OSError:
+                continue
+            for fn in names:
+                path = os.path.join(d, fn)
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    continue
+                with self._lock:
+                    hit = self._files.get(path)
+                if hit is None or hit[0] != mtime:
+                    try:
+                        _vendor, presets = read_opc_filaments(path)
+                        hit = (mtime, presets)
+                        self.errors.pop(path, None)
+                    except Exception as exc:
+                        self.errors[path] = str(exc)
+                        LOG.warning("could not read preset cache %s: %s", path, exc)
+                        hit = (mtime, {})
+                    with self._lock:
+                        self._files[path] = hit
+                for name, p in hit[1].items():
+                    merged.setdefault(name, p)
+        return merged
+
+
+# =====================================================================================================
 # Preset index (reads OrcaSlicer preset JSON files to recover filament_id, vendor, type, temps)
 # =====================================================================================================
 
@@ -1527,6 +1943,7 @@ class PresetIndex:
     def __init__(self) -> None:
         self._cache: dict[str, tuple[float, dict]] = {}
         self._lock = threading.Lock()
+        self.opc = OpcCatalog()
 
     def _read(self, path: str) -> dict:
         try:
@@ -1596,6 +2013,30 @@ class PresetIndex:
             if not p.color:
                 col = _first(resolve(p.name, "default_filament_colour"))
                 p.color = normalize_hex(col, "") if isinstance(col, str) and col.strip('"') else ""
+
+        # System presets in release builds have no JSON behind them: take what is missing from the
+        # installed vendor caches (.opc), which is OrcaSlicer's own built-in filament configuration.
+        missing = [p for p in presets if not p.filament_id or not p.type or not p.vendor]
+        if missing:
+            hints = [p.file for p in presets if p.file]
+            catalog = self.opc.load(hints)
+            if catalog:
+                hits = 0
+                for p in missing:
+                    rec = resolve_opc_chain(catalog, p.name)
+                    if rec is None and p.inherits:
+                        rec = resolve_opc_chain(catalog, p.inherits)
+                    if rec is None:
+                        continue
+                    hits += 1
+                    p.filament_id = p.filament_id or rec.filament_id
+                    p.vendor = p.vendor or rec.vendor
+                    p.type = p.type or rec.type
+                    p.min_temp = p.min_temp or rec.min_temp
+                    p.max_temp = p.max_temp or rec.max_temp
+                    p.pressure_advance = p.pressure_advance or rec.pressure_advance
+                    p.color = p.color or rec.color
+                LOG.info("preset cache lookup: %d of %d presets completed from %d cached filament profiles", hits, len(missing), len(catalog))
         return presets
 
 
@@ -1730,6 +2171,7 @@ if orca is not None:  # pragma: no cover - requires the OrcaSlicer host
             # ship system presets as binary .opc bundles, so this is the only source of ids for
             # them; it grows as the user puts presets into projects and is persisted in the config.
             self.known_ids: dict[str, str] = {}
+            self.live_agent = None  # the CrealityCfsAgent instance while OrcaSlicer has it connected
 
         def learn_project_filament_ids(self) -> None:
             """UI thread: `filament_ids` in the full config carries the id of every project filament."""
@@ -1785,12 +2227,21 @@ if orca is not None:  # pragma: no cover - requires the OrcaSlicer host
 
     SHARED = _SharedState()
 
+    _PLUGIN_LOG_PATH = _attach_plugin_log_file()
+    if _PLUGIN_LOG_PATH:
+        LOG.info("plugin log file: %s", _PLUGIN_LOG_PATH)
+
     DEFAULT_CONFIG = {
         "temps_from": "preset",  # or "library": use the printer library's temperature range / PA
         "allow_write_while_printing": False,
         "poll_interval_seconds": 15,
         "auto_open_panel": False,
         "notify_on_connect": True,
+        # Project -> CFS automatic sync: when the filament list in OrcaSlicer's sidebar changes
+        # (preset selection or colour), write the changed slots to the printer (filament 1 -> 1A, ...).
+        "auto_sync_project_to_cfs": True,
+        "auto_sync_debounce_seconds": 2.0,
+        "auto_sync_notify": True,
     }
 
     def _load_config(capability) -> dict[str, Any]:
@@ -1838,6 +2289,7 @@ if orca is not None:  # pragma: no cover - requires the OrcaSlicer host
             self._last_push = 0.0
             self._push_lock = threading.Lock()
             self._cfg = dict(DEFAULT_CONFIG)
+            self._autosync: Optional[_AutoSync] = None
 
         # -- identity / lifecycle -------------------------------------------------------------------
         def get_name(self):
@@ -1848,15 +2300,41 @@ if orca is not None:  # pragma: no cover - requires the OrcaSlicer host
 
         def on_load(self):
             self._cfg = _load_config(self)
+            self._autosync = AUTOSYNC
+            AUTOSYNC.start()
             LOG.info("agent loaded (v%s)", __version__)
 
         def on_unload(self):
+            AUTOSYNC.stop()
             self.disconnect_printer()
+            SHARED.queue_on_main = None
+
+        def _warn_if_switched_away(self):
+            """OrcaSlicer selected another printer agent (typically because the printer preset embedded
+            in an opened project has no Printer Agent). Tell the user how to keep live status."""
+            if SHARED.live_agent is not None or SHARED.queue_on_main is None:
+                return
+            if getattr(self, "_switch_warned", False):
+                return
+            self._switch_warned = True
+            LOG.warning("OrcaSlicer switched to another printer agent; filament auto-sync continues through the printer preset's address")
+            _notify_main(
+                "Creality CFS: the active printer preset no longer selects the 'Creality CFS (LAN)' agent "
+                "(projects embed their own printer preset). Filament changes still sync to the CFS; for live "
+                "printer status and the sidebar sync button, set Printer Settings > Advanced > Printer Agent and save the project.",
+                level="warning",
+            )
 
         def on_lifecycle_event(self, event, ctx):
             try:
-                if event == orca.LifecycleEvent.PresetSelected or event == orca.LifecycleEvent.PresetSaved:
+                LE = orca.LifecycleEvent
+                if event == LE.PresetSelected or event == LE.PresetSaved:
                     SHARED.refresh_presets_from_host()
+                if event in (LE.ProjectOpened, LE.NewProject, LE.ProjectClosed):
+                    AUTOSYNC.rebase()
+                elif event in (LE.PresetSelected, LE.PresetSaved, LE.ProjectDirtyChanged, LE.ObjectChanged):
+                    # Something in the project changed: take note now instead of waiting for the next poll.
+                    AUTOSYNC.tick_now()
             except Exception:
                 LOG.exception("lifecycle handler failed")
 
@@ -1897,7 +2375,14 @@ if orca is not None:  # pragma: no cover - requires the OrcaSlicer host
             return ORCA_NETWORK_SUCCESS
 
         def set_queue_on_main_fn(self, fn):
-            SHARED.queue_on_main = fn
+            # OrcaSlicer clears every callback of an agent it switches away from (it passes an empty
+            # function). The main-thread hop targets the application's event loop, which outlives any
+            # agent selection, and the project->CFS watcher needs it even when another agent is live,
+            # so keep the last valid hop instead of dropping it. It is released on unload.
+            if fn is not None:
+                SHARED.queue_on_main = fn
+            else:
+                LOG.info("host cleared the main-thread callback (agent switch); keeping the previous hop for the watcher")
             return ORCA_NETWORK_SUCCESS
 
         # -- connection -------------------------------------------------------------------------------
@@ -1917,6 +2402,9 @@ if orca is not None:  # pragma: no cover - requires the OrcaSlicer host
             client.poll_interval = float(self._cfg.get("poll_interval_seconds") or 15)
             client.add_listener(self._on_printer_message)
             self._client = client
+            SHARED.live_agent = self
+            self._autosync = AUTOSYNC
+            AUTOSYNC.start()
             LOG.info("connecting to %s as dev_id=%s", host, self._dev_id)
             snap = client.snapshot()
             if snap.connected:
@@ -1924,6 +2412,11 @@ if orca is not None:  # pragma: no cover - requires the OrcaSlicer host
             return ORCA_NETWORK_SUCCESS
 
         def disconnect_printer(self):
+            # The project->CFS watcher keeps running (it does not need the agent to be selected);
+            # only the status link to OrcaSlicer is dropped.
+            if SHARED.live_agent is self:
+                SHARED.live_agent = None
+                threading.Timer(4.0, self._warn_if_switched_away).start()
             client = self._client
             if client is not None:
                 client.remove_listener(self._on_printer_message)
@@ -2140,10 +2633,16 @@ if orca is not None:  # pragma: no cover - requires the OrcaSlicer host
 
         # -- filament sync --------------------------------------------------------------------------
         def get_filament_sync_mode(self):
+            # The host asks this on its UI thread after every status message it parses, which makes it
+            # a dependable heartbeat for the project->CFS watcher (see _AutoSync.host_hook).
+            if self._autosync is not None:
+                self._autosync.host_hook()
             return orca.printer_agent.FilamentSyncMode.Subscription
 
         def fetch_filament_info(self, dev_id, sync_mode):
             # Subscription mode: the sidebar already has the data; re-publish for good measure.
+            if self._autosync is not None:
+                self._autosync.host_hook()
             self._publish_status(force=True)
             return self._client is not None
 
@@ -2184,10 +2683,14 @@ if orca is not None:  # pragma: no cover - requires the OrcaSlicer host
 
         def show():
             try:
-                lvl = {"error": 3, "warning": 2}.get(level, 1)
+                levels = orca.host.ui.NotificationLevel
+                lvl = {
+                    "error": levels.ErrorNotificationLevel,
+                    "warning": levels.WarningNotificationLevel,
+                }.get(level, levels.RegularNotificationLevel)
                 orca.host.ui.push_notification(lvl, text)
             except Exception:
-                LOG.info("notification: %s", text)
+                LOG.info("notification (fallback): %s", text, exc_info=True)
 
         q = SHARED.queue_on_main
         if q is not None:
@@ -2200,6 +2703,222 @@ if orca is not None:  # pragma: no cover - requires the OrcaSlicer host
             show()
         else:
             LOG.info("notification (no UI thread hop available): %s", text)
+
+    class _AutoSync:
+        """Keeps the CFS slots in step with OrcaSlicer's sidebar filament list.
+
+        A background thread asks the host to run `_tick` on the UI thread every couple of seconds
+        (host objects may only be touched there). The tick snapshots the project's filaments; once the
+        list has been stable for the debounce period and differs from what was last applied, the
+        differing slots are written from a worker thread. While the printer is busy the change stays
+        pending and is applied as soon as it is idle again.
+        """
+
+        INTERVAL = 2.0
+
+        def __init__(self) -> None:
+            self._stop = threading.Event()
+            self._thread: Optional[threading.Thread] = None
+            self._last_sig: Optional[str] = None  # signature last applied (or seen at start)
+            self._pending_sig: Optional[str] = None
+            self._pending_since = 0.0
+            self._pending_project: list[dict] = []
+            self._blocked_notified = False
+            self._writing = False
+            self._lock = threading.Lock()
+            self.last_tick = 0.0  # when _tick last ran on the UI thread (0 = never)
+            self._ticks = 0
+            self._ticks_queue = 0
+            self._ticks_hook = 0
+            self._queue_failures = 0
+            self._reported_no_ticks = False
+            self._held_client: Optional[CrealityPrinterClient] = None
+
+        def _keepalive(self, _client: CrealityPrinterClient, _msg: dict) -> None:
+            """Registered as a listener so the printer link is not closed as idle while we watch."""
+
+        def _resolve_client(self) -> Optional[CrealityPrinterClient]:
+            """UI thread: the live agent's link if the plugin agent is selected, else a link to the
+            printer named in the current printer preset (OrcaSlicer may have switched agents, e.g.
+            because a project's embedded preset carries no Printer Agent)."""
+            agent = SHARED.live_agent
+            client = agent._client if agent is not None else None
+            if client is None:
+                host = _current_print_host()
+                if not host:
+                    return None
+                client = get_client(host)
+            if client is not self._held_client:
+                if self._held_client is not None:
+                    self._held_client.remove_listener(self._keepalive)
+                client.add_listener(self._keepalive)
+                self._held_client = client
+            return client
+
+        def _tick_from_queue(self) -> None:
+            self._ticks_queue += 1
+            self._tick()
+
+        def start(self) -> None:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._run, name="creality-cfs-autosync", daemon=True)
+            self._thread.start()
+            LOG.info("auto-sync watcher armed (queue_on_main available: %s)", SHARED.queue_on_main is not None)
+
+        def stop(self) -> None:
+            self._stop.set()
+
+        def _run(self) -> None:
+            started = time.time()
+            last_report = time.time()
+            while not self._stop.wait(self.INTERVAL):
+                if time.time() - last_report > 30:
+                    last_report = time.time()
+                    LOG.info("auto-sync: alive, ticks=%d (queued=%d, host-callback=%d), pending=%s",
+                             self._ticks, self._ticks_queue, self._ticks_hook, self._pending_sig is not None)
+                q = SHARED.queue_on_main
+                if q is not None:
+                    try:
+                        q(self._tick_from_queue)
+                    except Exception:
+                        self._queue_failures += 1
+                        if self._queue_failures <= 3:
+                            LOG.warning("auto-sync: queue_on_main call failed", exc_info=True)
+                if not self._reported_no_ticks and self._ticks == 0 and time.time() - started > 12:
+                    self._reported_no_ticks = True
+                    LOG.warning(
+                        "auto-sync: no UI-thread tick in 12s (queue_on_main %s); relying on host callbacks",
+                        "missing" if q is None else "not delivering",
+                    )
+
+        def rebase(self) -> None:
+            """UI thread: a project was opened or created - its filament list is the new baseline.
+
+            Only edits made after this point are synced; opening a project never rewrites the CFS.
+            """
+            self._last_sig = None
+            self._pending_sig = None
+            self._pending_project = []
+            LOG.info("auto-sync: project changed, taking its filament list as the new baseline")
+
+        def tick_now(self) -> None:
+            """UI thread: take note of a change right away (used on PresetSelected).
+
+            The write itself still waits for the debounce period, so stepping through several presets
+            in the dropdown results in one write, not one per step.
+            """
+            self._tick()
+
+        def host_hook(self) -> None:
+            """Called from agent methods the host invokes on its UI thread (get_filament_sync_mode,
+            fetch_filament_info). Gives the watcher a UI-thread heartbeat even when the queue callback
+            is unavailable; rate limited so it stays cheap."""
+            if threading.current_thread() is not threading.main_thread():
+                return
+            if time.time() - self.last_tick < 1.5:
+                return
+            self._ticks_hook += 1
+            self._tick()
+
+        # -- UI thread -------------------------------------------------------------------------------------
+        def _tick(self, force_debounce: bool = False) -> None:
+            try:
+                self._tick_impl(force_debounce)
+            except Exception:
+                LOG.exception("auto-sync tick failed")
+
+        def _tick_impl(self, force_debounce: bool = False) -> None:
+            if self._stop.is_set():
+                return
+            self.last_tick = time.time()
+            self._ticks += 1
+            if self._ticks == 1:
+                LOG.info("auto-sync: first UI-thread tick (main thread: %s)", threading.current_thread() is threading.main_thread())
+            cfg = SHARED.config or dict(DEFAULT_CONFIG)
+            if not cfg.get("auto_sync_project_to_cfs", True):
+                return
+            client = self._resolve_client()
+            if client is None:
+                return
+            try:
+                project = _collect_project_filaments()
+                SHARED.learn_project_filament_ids()
+            except Exception:
+                LOG.debug("auto-sync: project snapshot failed", exc_info=True)
+                return
+            sig = project_signature(project)
+            if self._last_sig is None:
+                # First look: adopt the current state as the baseline; only later changes sync.
+                self._last_sig = sig
+                LOG.info("auto-sync: baseline recorded (%d project filaments)", len(project))
+                return
+            if sig == self._last_sig and self._pending_sig is None:
+                return
+            now = time.time()
+            if sig != self._pending_sig:
+                self._pending_sig = sig
+                self._pending_since = now
+                self._pending_project = project
+                self._blocked_notified = False
+                LOG.info("auto-sync: project filament list changed, syncing after %.1fs of quiet", float(cfg.get("auto_sync_debounce_seconds") or 2.0))
+                if not force_debounce:
+                    return
+            debounce = float(cfg.get("auto_sync_debounce_seconds") or 2.0)
+            if not force_debounce and now - self._pending_since < debounce:
+                return
+            if sig == self._last_sig:
+                self._pending_sig = None
+                return
+            with self._lock:
+                if self._writing:
+                    return
+            snap = client.snapshot()
+            if not snap.connected or not snap.boxes:
+                return
+            force = bool(cfg.get("allow_write_while_printing"))
+            reason = client.check_writable(snap)
+            if reason and not force:
+                if not self._blocked_notified and cfg.get("auto_sync_notify", True):
+                    _notify_main(f"Creality CFS: filament change queued, {reason}.", level="warning")
+                    self._blocked_notified = True
+                return
+            plan = plan_project_sync(self._pending_project, SHARED.get_presets(), snap, str(cfg.get("temps_from") or "preset"))
+            self._last_sig = sig
+            self._pending_sig = None
+            if not plan:
+                LOG.info("auto-sync: project filaments changed but the CFS already matches")
+                return
+            with self._lock:
+                self._writing = True
+            threading.Thread(target=self._apply, args=(client, plan, force), name="creality-cfs-autosync-write", daemon=True).start()
+
+        # -- worker thread -----------------------------------------------------------------------------------
+        def _apply(self, client: CrealityPrinterClient, plan: list[tuple[CfsSlot, MaterialSpec]], force: bool) -> None:
+            results = []
+            try:
+                for slot, spec in plan:
+                    result = client.modify_material(slot.box_id, slot.slot_id, spec, force=force)
+                    results.append((slot, spec, result))
+                    LOG.info("auto-sync %s: %s", slot.label, result.message)
+            finally:
+                with self._lock:
+                    self._writing = False
+            agent = SHARED.live_agent
+            if agent is not None:
+                agent._publish_status(force=True)
+            if (SHARED.config or DEFAULT_CONFIG).get("auto_sync_notify", True):
+                ok = [f"{s.label} {'cleared' if sp.is_clear else sp.name}" for s, sp, r in results if r.ok]
+                bad = [f"{s.label}: {r.message}" for s, _sp, r in results if not r.ok]
+                if ok:
+                    _notify_main("Creality CFS updated: " + ", ".join(ok))
+                if bad:
+                    _notify_main("Creality CFS sync failed for " + "; ".join(bad), level="error")
+
+    # One watcher for the whole plugin: started when the plugin loads, independent of which printer
+    # agent OrcaSlicer currently has selected.
+    AUTOSYNC = _AutoSync()
 
     # -------------------------------------------------------------------------------------------------
     # Manager panel capability
@@ -2405,6 +3124,10 @@ if orca is not None:  # pragma: no cover - requires the OrcaSlicer host
                     SHARED.refresh_presets_from_host()
                     if self.panel is not None and self.panel.is_open():
                         self._ensure_client(_current_print_host())
+                if event in (orca.LifecycleEvent.ProjectOpened, orca.LifecycleEvent.NewProject, orca.LifecycleEvent.ProjectClosed):
+                    AUTOSYNC.rebase()
+                elif event == orca.LifecycleEvent.ProjectDirtyChanged:
+                    AUTOSYNC.tick_now()
                 auto_open = bool(self._cfg.get("auto_open_panel")) or os.environ.get("CREALITY_CFS_AUTO_OPEN") == "1"
                 if auto_open and self.panel is None and event in (
                     orca.LifecycleEvent.DeviceSelected,

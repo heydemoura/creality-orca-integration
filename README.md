@@ -55,7 +55,37 @@ printer; empty slots are left out. Matching follows OrcaSlicer's own rules for C
 exact product name wins (for example *Hyper PLA*), then vendor, then the plainest preset of the same
 material type.
 
-### Writing filaments to the CFS
+### Automatic sync from the sidebar filament list
+
+With the printer agent selected, the plugin keeps the CFS in step with OrcaSlicer's own filament
+section automatically: change the preset or the colour of filament 1, 2, 3 or 4 in the sidebar and,
+about two seconds after you stop changing things, the matching CFS slot (1A, 1B, 1C, 1D) is written
+with that preset's material, colour, temperature range and pressure advance. Only slots that differ
+are written, slots holding a Creality RFID spool are left alone, and the state found when OrcaSlicer
+starts is taken as the baseline, so nothing is written until you actually change something. If the
+printer is printing or moving filament at that moment, the change is queued and applied when the
+printer is idle again; a notification tells you either way.
+
+Switches in the plugin config: `auto_sync_project_to_cfs` (default on), `auto_sync_debounce_seconds`
+(default 2), `auto_sync_notify` (default on). The reverse direction is OrcaSlicer's own sync button in
+the sidebar, which pulls the CFS slots into the project.
+
+Opening or creating a project takes that project's filament list as the new baseline (a project is
+never pushed to the CFS just by opening it); edits you make afterwards are synced.
+
+The watcher runs as long as the plugin is loaded and does not depend on which printer agent
+OrcaSlicer has selected: it talks to the printer named in the active printer preset. Be aware that
+a 3MF project embeds its own printer preset, and if that embedded preset was saved without the
+*Printer Agent* setting, OrcaSlicer switches back to its default agent when the project opens. The
+filament sync keeps working, but live printer status and the sidebar AMS sync button need the
+plugin agent; the plugin shows a notification when this happens. To fix it permanently, set
+*Printer Settings → Advanced → Printer Agent* to *Creality CFS (LAN)* with the project open and save
+the project.
+
+The plugin writes its own log to `<datadir>/orca_plugins/plugin_data/creality_cfs/creality_cfs.log`
+(OrcaSlicer's Python log misses lines emitted on its UI thread).
+
+### Writing filaments to the CFS by hand
 
 Run **Creality CFS Manager** from the Plugins dialog. A panel docks next to the 3D view showing every
 slot as the printer reports it. For each slot pick a *project filament* (the colours of your project
@@ -111,14 +141,19 @@ fake printer (reads, verified writes, the printing interlock, reconnects, heartb
 * The OrcaSlicer integration (agent + panel) follows the host API in OrcaSlicer `main`; see
   `orca-patch/README.md` for the state of the optional C++ patch.
 
-### Known limitation: filament ids of system presets
+### Where the built-in filament configuration comes from
 
-OrcaSlicer's Python API does not expose a preset's `filament_id`, and release builds ship the system
-presets as binary `.opc` bundles, so the plugin can only learn ids from presets that are (or have
-been) in a project, and from user presets saved as JSON. For a slot whose best-matching preset has
-no known id, the plugin publishes a non-empty placeholder id; OrcaSlicer then falls back to the
-"Generic &lt;type&gt;" preset for that slot during sync, and the panel still shows the preset the
-plugin would have picked. Putting a preset into the project once teaches the plugin its id.
+The sync maps each CFS slot onto one of OrcaSlicer's **built-in filament presets** for your printer
+(for example *Hyper PLA @K1 Max_CFS-C-all* or *Generic PLA @K1 Max_CFS-C-all*) and publishes that
+preset's `filament_id`, so OrcaSlicer selects exactly that preset when you synchronize. OrcaSlicer's
+Python API does not expose preset ids, and release builds ship the system presets as binary vendor
+caches (`<datadir>/system/<Vendor>.opc`) rather than JSON, so the plugin reads those caches directly:
+it understands OrcaSlicer's cache format (version 2, CRC-checked), resolves each preset's `inherits`
+chain the way OrcaSlicer does, and takes the id, vendor, material type, nozzle temperature range,
+pressure advance and default colour from there. JSON preset files (user presets, source checkouts)
+and the ids of filaments already in the project are used as well. Only when a preset cannot be found
+anywhere does the plugin publish a placeholder id, which makes OrcaSlicer fall back to the
+"Generic &lt;type&gt;" preset for that slot.
 
 ### Developer switches
 
